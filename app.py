@@ -5,6 +5,7 @@ from ultralytics import YOLO
 import cv2
 import numpy as np
 from io import BytesIO
+import os
 
 # Create FastAPI app
 app = FastAPI()
@@ -19,6 +20,10 @@ app.add_middleware(
 
 # Load YOLO model
 model = YOLO("yolov8n.pt")
+
+@app.get("/")
+async def root():
+    return {"message": "Object Detection API is running!"}
 
 @app.post("/detect-image")
 async def detect_image(file: UploadFile = File(...)):
@@ -36,3 +41,8 @@ async def detect_image(file: UploadFile = File(...)):
     # Encode image to JPEG for sending back
     _, img_encoded = cv2.imencode('.jpg', annotated)
     return StreamingResponse(BytesIO(img_encoded.tobytes()), media_type="image/jpeg")
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

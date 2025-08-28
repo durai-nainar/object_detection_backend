@@ -1,7 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
 import cv2
 import numpy as np
 from io import BytesIO
@@ -19,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Create FastAPI app
-app = FastAPI()
+app = FastAPI(title="Object Detection API", version="1.0.0")
 
 # Enable CORS so frontend can talk to backend
 app.add_middleware(
@@ -29,8 +28,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load YOLO model
-model = YOLO("yolov8n.pt")
+# Global model variable
+model = None
 
 # Performance settings
 FRAME_SKIP = 2  # Process every 2nd frame for live detection
@@ -52,6 +51,20 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+def load_yolo_model():
+    """Load YOLO model with error handling"""
+    global model
+    try:
+        from ultralytics import YOLO
+        logger.info("Loading YOLOv8 model...")
+        model = YOLO("yolov8n.pt")
+        logger.info("✅ YOLOv8 model loaded successfully!")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to load YOLO model: {e}")
+        model = None
+        return False
+
 def resize_for_speed(image, max_size=640):
     """Resize image for faster processing while maintaining aspect ratio"""
     height, width = image.shape[:2]
@@ -67,46 +80,80 @@ def resize_for_speed(image, max_size=640):
     
     return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the model on startup"""
+    logger.info("🚀 Starting up Object Detection API...")
+    success = load_yolo_model()
+    if success:
+        logger.info("✅ Startup completed successfully!")
+    else:
+        logger.warning("⚠️ Started without YOLO model - some features may not work")
+
 @app.get("/")
 async def root():
-    return {"message": "Object Detection API is running!"}
+    return {
+        "message": "Object Detection API is running!",
+        "model_loaded": model is not None,
+        "status": "healthy"
+    }
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
-        "model_loaded": True,
-        "active_websockets": len(manager.active_connections)
+        "model_loaded": model is not None,
+        "active_websockets": len(manager.active_connections),
+        "endpoints": {
+            "image_detection": "/detect-image",
+            "video_detection": "/detect-video", 
+            "live_detection": "/ws",
+            "configuration": "/configure"
+        }
     }
 
-# Your existing image detection endpoint (unchanged)
 @app.post("/detect-image")
 async def detect_image(file: UploadFile = File(...)):
-    # Read uploaded file
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    """Original image detection endpoint"""
     
-    if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image format")
+    if model is None:
+        raise HTTPException(status_code=503, detail="YOLO model not loaded. Check server logs.")
     
-    # Run YOLO detection
-    results = model(img, conf=CONFIDENCE_THRESHOLD)
-    
-    # Draw detection results on image
-    annotated = results[0].plot()
-    
-    # Encode image to JPEG for sending back
-    _, img_encoded = cv2.imencode('.jpg', annotated)
-    return StreamingResponse(BytesIO(img_encoded.tobytes()), media_type="image/jpeg")
+    try:
+        # Read uploaded file
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            raise HTTPException(status_code=400, detail="Invalid image format")
+        
+        # Run YOLO detection
+        results = model(img, conf=CONFIDENCE_THRESHOLD)
+        
+        # Draw detection results on image
+        annotated = results[0].plot()
+        
+        # Encode image to JPEG for sending back
+        _, img_encoded = cv2.imencode('.jpg', annotated)
+        return StreamingResponse(BytesIO(img_encoded.tobytes()), media_type="image/jpeg")
+        
+    except Exception as e:
+        logger.error(f"Image detection error: {e}")
+        raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
 
-# NEW: Video detection endpoint
 @app.post("/detect-video")
 async def detect_video(file: UploadFile = File(...)):
     """Process uploaded video and return annotated version"""
     
-    if not file.content_type.startswith("video/"):
+    if model is None:
+        raise HTTPException(status_code=503, detail="YOLO model not loaded")
+    
+    if not file.content_type or not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="File must be a video")
+    
+    input_path = None
+    output_path = None
     
     try:
         # Save uploaded video temporarily
@@ -118,6 +165,8 @@ async def detect_video(file: UploadFile = File(...)):
         
         # Open video
         cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise HTTPException(status_code=400, detail="Could not open video file")
         
         # Get video properties
         fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -125,12 +174,15 @@ async def detect_video(file: UploadFile = File(...)):
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
+        if fps <= 0 or width <= 0 or height <= 0:
+            raise HTTPException(status_code=400, detail="Invalid video properties")
+        
         # Setup video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
         frame_count = 0
-        logger.info(f"Processing video: {total_frames} frames")
+        logger.info(f"Processing video: {total_frames} frames at {fps} FPS")
         
         while True:
             ret, frame = cap.read()
@@ -139,7 +191,7 @@ async def detect_video(file: UploadFile = File(...)):
             
             frame_count += 1
             
-            # Process every nth frame for speed, copy others
+            # Process every nth frame for speed
             if frame_count % FRAME_SKIP == 0:
                 try:
                     # Resize for faster processing
@@ -160,21 +212,23 @@ async def detect_video(file: UploadFile = File(...)):
             else:
                 out.write(frame)
             
-            # Log progress
+            # Log progress every 100 frames
             if frame_count % 100 == 0:
-                progress = (frame_count / total_frames) * 100
+                progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
                 logger.info(f"Progress: {progress:.1f}%")
         
         cap.release()
         out.release()
         
         # Clean up input file
-        os.unlink(input_path)
+        if input_path and os.path.exists(input_path):
+            os.unlink(input_path)
         
         # Return processed video
         def cleanup():
             try:
-                os.unlink(output_path)
+                if output_path and os.path.exists(output_path):
+                    os.unlink(output_path)
             except:
                 pass
         
@@ -185,19 +239,28 @@ async def detect_video(file: UploadFile = File(...)):
             background=cleanup
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Video processing error: {e}")
-        # Cleanup
-        if 'input_path' in locals() and os.path.exists(input_path):
-            os.unlink(input_path)
-        if 'output_path' in locals() and os.path.exists(output_path):
-            os.unlink(output_path)
-        raise HTTPException(status_code=500, detail=str(e))
+        # Cleanup files
+        try:
+            if input_path and os.path.exists(input_path):
+                os.unlink(input_path)
+            if output_path and os.path.exists(output_path):
+                os.unlink(output_path)
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=f"Video processing failed: {str(e)}")
 
-# NEW: WebSocket endpoint for live detection
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """Real-time object detection via WebSocket"""
+    
+    if model is None:
+        await websocket.close(code=1000, reason="YOLO model not loaded")
+        return
+    
     await manager.connect(websocket)
     
     try:
@@ -276,7 +339,7 @@ async def websocket_endpoint(websocket: WebSocket):
             except WebSocketDisconnect:
                 break
             except Exception as e:
-                logger.error(f"WebSocket error: {e}")
+                logger.error(f"WebSocket message error: {e}")
                 break
                 
     except Exception as e:
@@ -284,7 +347,6 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         manager.disconnect(websocket)
 
-# NEW: Configuration endpoint
 @app.post("/configure")
 async def configure_detection(
     confidence: float = None,
@@ -315,4 +377,5 @@ async def configure_detection(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
+    logger.info(f"Starting server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)

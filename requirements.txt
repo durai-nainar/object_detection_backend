@@ -7,4 +7,3 @@ numpy
 fastapi
 uvicorn
 python-multipart
-websockets

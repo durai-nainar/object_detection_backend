@@ -1,5 +1,9 @@
-fastapi==0.115.1
-uvicorn==0.23.2
-ultralytics==8.3.1
-opencv-python-headless==4.8.1.76
-numpy==1.26.5
+flask
+flask-cors
+gunicorn
+ultralytics
+opencv-python-headless
+numpy
+fastapi
+uvicorn
+python-multipart
